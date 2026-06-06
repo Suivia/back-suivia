@@ -2,23 +2,28 @@ spring:
   application:
     name: back-suivia
 
-  # Conexão com o RDS criado pelo Terraform
   datasource:
-    # IMPORTANTE: Troque DB_HOST pelo endpoint real do RDS (veja no console AWS)
-    url: jdbc:postgresql://${DB_HOST:localhost}:5432/postgres
-    username: postgres
-    password: Suivia123!
+    url: jdbc:postgresql://${DB_HOST:localhost}:5432/suivia
+    username: ${DB_USER:postgres}
+    password: ${DB_PASS:Suivia123!}
+    driver-class-name: org.postgresql.Driver
 
   jpa:
     hibernate:
-      ddl-auto: update # Cria as tabelas automaticamente no inicio
-    show-sql: true
+      ddl-auto: update
+    show-sql: false
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.PostgreSQLDialect
+        format_sql: true
 
-# Configurações da AWS
 spring.cloud.aws:
   region:
     static: sa-east-1
-  s3:
-    bucket: suivia-invoices-raw-dev-unique123
-  sqs:
-    queue: suivia-match-queue
+  credentials:
+    use-default-aws-credentials-chain: true
+
+suivia:
+  aws:
+    s3-bucket: suivia-invoices-raw-dev-unique123
+    sqs-queue: suivia-match-queue
