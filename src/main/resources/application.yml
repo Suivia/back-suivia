@@ -1,29 +1,25 @@
 spring:
   application:
-    name: back-suivia
-
+    name: suivia-backend
   datasource:
-    url: jdbc:postgresql://${DB_HOST:localhost}:5432/suivia
+    url: jdbc:postgresql://${DB_HOST:localhost}:5432/${DB_NAME:suiviadb}
     username: ${DB_USER:postgres}
-    password: ${DB_PASS:Suivia123!}
-    driver-class-name: org.postgresql.Driver
-
+    password: ${DB_PASS:postgres}
   jpa:
     hibernate:
-      ddl-auto: update
+      ddl-auto: validate # Flyway gerencia o banco! Evita quebras no mapeamento.
     show-sql: false
-    properties:
-      hibernate:
-        dialect: org.hibernate.dialect.PostgreSQLDialect
-        format_sql: true
+  flyway:
+    enabled: true
+    baseline-on-migrate: true
 
-spring.cloud.aws:
-  region:
-    static: sa-east-1
-  credentials:
-    use-default-aws-credentials-chain: true
+aws:
+  region: sa-east-1
+  s3:
+    bucket: suivia-invoices-raw
+  sqs:
+    queue-name: suivia-match-queue
 
-suivia:
-  aws:
-    s3-bucket: suivia-invoices-raw-dev-unique123
-    sqs-queue: suivia-match-queue
+focusnfe:
+  base-url: https://api.focusnfe.com.br
+  token: ${FOCUS_NFE_TOKEN:mock_token_para_dev}
