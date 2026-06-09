@@ -1,0 +1,16 @@
+version: '3.8'
+services:
+  suivia-db:
+    image: postgres:15-alpine
+    container_name: suivia-postgres
+    environment:
+      POSTGRES_USER: suivia
+      POSTGRES_PASSWORD: suivia_password
+      POSTGRES_DB: suivia_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - suivia_pgdata:/var/lib/postgresql/data
+
+volumes:
+  suivia_pgdata:
