@@ -40,6 +40,21 @@ public final class Api {
                 .withBody(Json.write(body));
     }
 
+    /** RF14 — CSV export response (e.g. audit trail download). */
+    public static APIGatewayProxyResponseEvent csv(String filename, String csvBody) {
+        Map<String, String> headers = Map.of(
+                "Content-Type", "text/csv",
+                "Content-Disposition", "attachment; filename=\"" + filename + "\"",
+                "Access-Control-Allow-Origin", "*",
+                "Access-Control-Allow-Headers", "Authorization,Content-Type",
+                "Access-Control-Allow-Methods", "GET,POST,PUT,OPTIONS"
+        );
+        return new APIGatewayProxyResponseEvent()
+                .withStatusCode(200)
+                .withHeaders(headers)
+                .withBody(csvBody);
+    }
+
     @SuppressWarnings("unchecked")
     public static Map<String, String> claims(APIGatewayProxyRequestEvent e) {
         var rc = e.getRequestContext();

@@ -4,7 +4,7 @@ import com.amazonaws.services.lambda.runtime.Context;
 import com.amazonaws.services.lambda.runtime.RequestHandler;
 import com.amazonaws.services.lambda.runtime.events.SQSEvent;
 import com.suivia.lambda.shared.Dynamo;
-import com.suivia.lambda.shared.Http;
+import com.suivia.lambda.shared.Erp;
 import com.suivia.lambda.shared.Json;
 import com.suivia.lambda.shared.Similarity;
 import com.suivia.lambda.shared.Val;
@@ -14,6 +14,7 @@ import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -30,7 +31,6 @@ public class MatchEngineHandler implements RequestHandler<SQSEvent, Void> {
     private static final String MATCH = System.getenv("MATCH_TABLE");
     private static final String TOLERANCE = System.getenv("TOLERANCE_TABLE");
     private static final String AUDIT = System.getenv("AUDIT_TABLE");
-    private static final String ERP_API_URL = envOr("ERP_API_URL", "");
 
     @Override
     public Void handleRequest(SQSEvent event, Context context) {
@@ -60,7 +60,8 @@ public class MatchEngineHandler implements RequestHandler<SQSEvent, Void> {
             return;
         }
 
-        Map<String, Object> po = findPurchaseOrder(staging);
+        double nfTotal = Val.dbl(staging.get("total_amount"));
+        Map<String, Object> po = findPurchaseOrder(staging, nfTotal);
 
         long score = 0;
         List<Map<String, Object>> divergences = new ArrayList<>();
@@ -76,15 +77,16 @@ public class MatchEngineHandler implements RequestHandler<SQSEvent, Void> {
             headerMatch.put("cnpj", false);
             divergences.add(makeDiverg("cnpj_mismatch", "critical", "supplier_cnpj",
                     po != null ? Val.str(po.get("supplier_cnpj"), "?") : "no_po",
-                    Val.str(staging.get("supplier_cnpj"), "?"), null, false));
+                    Val.str(staging.get("supplier_cnpj"), "?"), null, false, ""));
             saveMatch(stagingId, 0, "REJEITADA_CRITICA", headerMatch, divergences, Map.of(), "", null);
             return;
         }
 
-        // Criterion 2: total value (25%)
-        double nfTotal = Val.dbl(staging.get("total_amount"));
+        // Criterion 2: total value (25%) — RF09/RN05 tolerance may be supplier-specific
         double poTotal = po != null ? Val.dbl(po.get("total_amount")) : 0;
-        double tolValue = getTolerance(tenant, "value");
+        Map<String, Object> valueTolRule = getTolerance(tenant, "value", nfCnpj);
+        double tolValue = Val.dbl(valueTolRule.get("threshold"));
+        String valueAdjAccount = Val.str(valueTolRule.get("adjustment_account"));
         double valDiff = Math.abs(nfTotal - poTotal);
         if (valDiff == 0) {
             score += 25;
@@ -92,17 +94,19 @@ public class MatchEngineHandler implements RequestHandler<SQSEvent, Void> {
         } else if (poTotal > 0 && (valDiff / poTotal) <= tolValue) {
             score += 25;
             headerMatch.put("value", "tolerance");
-            divergences.add(makeDiverg("price", "low", "total_amount", poTotal, nfTotal, valDiff, true));
+            divergences.add(makeDiverg("price", "low", "total_amount", poTotal, nfTotal, valDiff, true, valueAdjAccount));
         } else {
             score += 10;
             headerMatch.put("value", false);
-            divergences.add(makeDiverg("price", "high", "total_amount", poTotal, nfTotal, valDiff, false));
+            divergences.add(makeDiverg("price", "high", "total_amount", poTotal, nfTotal, valDiff, false, ""));
         }
 
         // Criterion 3: items / quantity (25%)
         List<Map<String, Object>> nfItems = toMapList(Json.readList(Val.str(staging.get("extracted_items"), "[]")));
         List<Map<String, Object>> poItems = po != null ? toMapList(po.get("items")) : new ArrayList<>();
-        Object[] itemResult = matchItems(nfItems, poItems, getTolerance(tenant, "quantity"));
+        Map<String, Object> qtyTolRule = getTolerance(tenant, "quantity", nfCnpj);
+        Object[] itemResult = matchItems(nfItems, poItems, Val.dbl(qtyTolRule.get("threshold")),
+                Val.str(qtyTolRule.get("adjustment_account")));
         score += (long) itemResult[0];
         divergences.addAll((List<Map<String, Object>>) itemResult[1]);
         List<Map<String, Object>> itemsMatch = (List<Map<String, Object>>) itemResult[2];
@@ -122,15 +126,36 @@ public class MatchEngineHandler implements RequestHandler<SQSEvent, Void> {
             divergences.add((Map<String, Object>) dateResult[1]);
         }
 
+        // RN08 — NFSe/manual notes without an XML key require mandatory manual review,
+        // so they can never be classified as touchless-approved (score capped at 99).
+        if (score == 100 && Boolean.TRUE.equals(staging.get("requires_manual_validation"))) {
+            score = 99;
+        }
+
         String status = classify(score);
         String matchId = saveMatch(stagingId, score, status, headerMatch, divergences, taxMatch,
                 po != null ? Val.str(po.get("id")) : "", itemsMatch);
 
         if (status.equals("APROVADA")) {
-            postToErp(staging, po, matchId);
+            Erp.postAccountsPayable(staging, po, matchId);
+        } else if (status.equals("REJEITADA") || status.equals("REJEITADA_CRITICA")) {
+            Erp.blockPayment(matchId, status);
         }
 
+        postToleranceAdjustments(matchId, divergences);
         checkToleranceLearning(tenant, staging, divergences);
+    }
+
+    /** RN05 — every applied tolerance generates a posting to the configured adjustment account. */
+    private void postToleranceAdjustments(String matchId, List<Map<String, Object>> divergences) {
+        for (Map<String, Object> d : divergences) {
+            if (!Boolean.TRUE.equals(d.get("tolerance_applied"))) {
+                continue;
+            }
+            String account = Val.str(d.get("adjustment_account"));
+            double amount = Val.dbl(d.get("difference"));
+            Erp.postAdjustment(matchId, account, amount, Val.str(d.get("divergence_type")));
+        }
     }
 
     /**
@@ -172,40 +197,30 @@ public class MatchEngineHandler implements RequestHandler<SQSEvent, Void> {
 
     // ───────────────────────── PO lookup ─────────────────────────
 
-    @SuppressWarnings("unchecked")
-    private Map<String, Object> findPurchaseOrder(Map<String, Object> staging) {
-        try {
-            String cnpj = Val.str(staging.get("supplier_cnpj"));
-            String hint = Val.str(staging.get("po_hint"));
-            String url = ERP_API_URL + "/purchase-orders?cnpj=" + cnpj + "&hint=" + hint;
-            String resp = Http.get(url, 5);
-            List<Object> data = Json.readList(resp);
-            if (!data.isEmpty() && data.get(0) instanceof Map) {
-                return (Map<String, Object>) data.get(0);
+    /** RF07 — picks the open PO for this CNPJ whose total is closest to the invoice total. */
+    private Map<String, Object> findPurchaseOrder(Map<String, Object> staging, double nfTotal) {
+        String cnpj = Val.str(staging.get("supplier_cnpj"));
+        String hint = Val.str(staging.get("po_hint"));
+        List<Map<String, Object>> candidates = Erp.listPurchaseOrders(cnpj, hint);
+        if (candidates.isEmpty()) {
+            return null;
+        }
+        if (!hint.isEmpty()) {
+            for (Map<String, Object> c : candidates) {
+                if (hint.equals(Val.str(c.get("id"))) || hint.equals(Val.str(c.get("number")))) {
+                    return c;
+                }
             }
-        } catch (Exception e) {
-            System.out.println("ERP PO lookup failed: " + e.getMessage());
         }
-        return null;
-    }
-
-    private void postToErp(Map<String, Object> staging, Map<String, Object> po, String matchId) {
-        try {
-            Map<String, Object> payload = new HashMap<>();
-            payload.put("match_id", matchId);
-            payload.put("invoice_number", staging.get("invoice_number"));
-            payload.put("supplier_cnpj", staging.get("supplier_cnpj"));
-            payload.put("total_amount", Val.dbl(staging.get("total_amount")));
-            payload.put("po_id", po != null ? Val.str(po.get("id")) : "");
-            Http.postJson(ERP_API_URL + "/accounts-payable", Json.write(payload), 8);
-        } catch (Exception e) {
-            System.out.println("ERP post failed: " + e.getMessage());
-        }
+        return candidates.stream()
+                .min(Comparator.comparingDouble(c -> Math.abs(Val.dbl(c.get("total_amount")) - nfTotal)))
+                .orElse(candidates.get(0));
     }
 
     // ───────────────────────── scoring ─────────────────────────
 
-    private Object[] matchItems(List<Map<String, Object>> nfItems, List<Map<String, Object>> poItems, double qtyTol) {
+    private Object[] matchItems(List<Map<String, Object>> nfItems, List<Map<String, Object>> poItems,
+                                 double qtyTol, String adjAccount) {
         double score = 0;
         List<Map<String, Object>> divs = new ArrayList<>();
         List<Map<String, Object>> matches = new ArrayList<>();
@@ -215,7 +230,7 @@ public class MatchEngineHandler implements RequestHandler<SQSEvent, Void> {
             String desc = Val.str(poItem.get("description"));
             Map<String, Object> best = findBestItemMatch(poItem, nfItems);
             if (best == null) {
-                divs.add(makeDiverg("quantity", "high", desc, Val.dbl(poItem.get("quantity")), 0, null, false));
+                divs.add(makeDiverg("quantity", "high", desc, Val.dbl(poItem.get("quantity")), 0, null, false, ""));
                 Map<String, Object> m = new HashMap<>();
                 m.put("po_item", desc);
                 m.put("nf_item", null);
@@ -236,9 +251,10 @@ public class MatchEngineHandler implements RequestHandler<SQSEvent, Void> {
                 score += maxPerItem;
             } else if (similarity >= 0.6) {
                 score += maxPerItem * 0.5;
-                divs.add(makeDiverg("quantity", "medium", desc, qtyPo, qtyNf, qtyDiff, qtyDiff == 0));
+                divs.add(makeDiverg("quantity", "medium", desc, qtyPo, qtyNf, qtyDiff, qtyDiff == 0,
+                        qtyDiff == 0 ? adjAccount : ""));
             } else {
-                divs.add(makeDiverg("quantity", "high", desc, qtyPo, qtyNf, qtyDiff, false));
+                divs.add(makeDiverg("quantity", "high", desc, qtyPo, qtyNf, qtyDiff, false, ""));
             }
 
             Map<String, Object> m = new HashMap<>();
@@ -303,7 +319,7 @@ public class MatchEngineHandler implements RequestHandler<SQSEvent, Void> {
             if (ok) {
                 score += 3.75;
             } else {
-                divs.add(makeDiverg("tax", "medium", type, poVal, nfVal, diff, false));
+                divs.add(makeDiverg("tax", "medium", type, poVal, nfVal, diff, false, ""));
             }
         }
         long capped = Math.min(Math.round(score), 15);
@@ -320,7 +336,7 @@ public class MatchEngineHandler implements RequestHandler<SQSEvent, Void> {
             if (diffDays <= 60) {
                 return new Object[]{10L, null};
             }
-            return new Object[]{5L, makeDiverg("date", "low", "issue_date", "< 60 days", diffDays + " days", null, false)};
+            return new Object[]{5L, makeDiverg("date", "low", "issue_date", "< 60 days", diffDays + " days", null, false, "")};
         } catch (Exception e) {
             return new Object[]{5L, null};
         }
@@ -339,25 +355,52 @@ public class MatchEngineHandler implements RequestHandler<SQSEvent, Void> {
         return "REJEITADA";
     }
 
-    private double getTolerance(String tenant, String type) {
+    /**
+     * RF09/RN05 — resolves the tolerance rule for {@code type}, preferring a rule scoped to
+     * {@code supplierCnpj} over the tenant-wide rule. Returns {@code threshold} (default if no
+     * rule matches) and {@code adjustment_account} (empty if not configured).
+     */
+    private Map<String, Object> getTolerance(String tenant, String type, String supplierCnpj) {
         double def = type.equals("quantity") ? 0.05 : 0.02;
+        Map<String, Object> result = new HashMap<>();
+        result.put("threshold", def);
+        result.put("adjustment_account", "");
         try {
             List<Map<String, Object>> items = Dynamo.query(TOLERANCE, "tenant-index", "tenant_id", tenant);
+            Map<String, Object> tenantWide = null;
             for (Map<String, Object> item : items) {
-                if (type.equals(Val.str(item.get("type")))) {
-                    return item.get("threshold") != null ? Val.dbl(item.get("threshold")) : def;
+                if (!type.equals(Val.str(item.get("type")))) {
+                    continue;
                 }
+                String ruleCnpj = Val.str(item.get("supplier_cnpj"));
+                if (!ruleCnpj.isEmpty() && ruleCnpj.equals(supplierCnpj)) {
+                    return ruleResult(item, def);
+                }
+                if (ruleCnpj.isEmpty() && tenantWide == null) {
+                    tenantWide = item;
+                }
+            }
+            if (tenantWide != null) {
+                return ruleResult(tenantWide, def);
             }
         } catch (Exception e) {
             // fall through to default
         }
-        return def;
+        return result;
+    }
+
+    private Map<String, Object> ruleResult(Map<String, Object> rule, double def) {
+        Map<String, Object> result = new HashMap<>();
+        result.put("threshold", rule.get("threshold") != null ? Val.dbl(rule.get("threshold")) : def);
+        result.put("adjustment_account", Val.str(rule.get("adjustment_account")));
+        return result;
     }
 
     // ───────────────────────── persistence ─────────────────────────
 
     private Map<String, Object> makeDiverg(String dtype, String severity, String field,
-                                           Object expected, Object actual, Double diff, boolean tol) {
+                                           Object expected, Object actual, Double diff, boolean tol,
+                                           String adjustmentAccount) {
         Map<String, Object> d = new HashMap<>();
         d.put("id", UUID.randomUUID().toString());
         d.put("divergence_type", dtype);
@@ -367,6 +410,7 @@ public class MatchEngineHandler implements RequestHandler<SQSEvent, Void> {
         d.put("actual_value", Val.str(actual));
         d.put("difference", diff != null ? String.valueOf(diff) : "");
         d.put("tolerance_applied", tol);
+        d.put("adjustment_account", adjustmentAccount == null ? "" : adjustmentAccount);
         d.put("resolution", tol ? "auto_approved" : "pending");
         return d;
     }
@@ -422,10 +466,5 @@ public class MatchEngineHandler implements RequestHandler<SQSEvent, Void> {
     @SuppressWarnings("unchecked")
     private static Map<String, Object> toMap(Object o) {
         return o instanceof Map ? (Map<String, Object>) o : new HashMap<>();
-    }
-
-    private static String envOr(String k, String def) {
-        String v = System.getenv(k);
-        return (v == null || v.isEmpty()) ? def : v;
     }
 }

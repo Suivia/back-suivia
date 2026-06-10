@@ -28,6 +28,33 @@ public class AuditHandler implements RequestHandler<APIGatewayProxyRequestEvent,
 
         items.sort(Comparator.comparing(
                 (Map<String, Object> x) -> Val.str(x.get("timestamp"))).reversed());
+
+        String format = qp == null ? null : qp.get("format");
+        if ("csv".equalsIgnoreCase(format)) {
+            return Api.csv("audit-export.csv", toCsv(items));
+        }
         return Api.ok(items);
+    }
+
+    /** RF14 — exporta a trilha de auditoria em CSV. */
+    private String toCsv(List<Map<String, Object>> items) {
+        StringBuilder sb = new StringBuilder("timestamp,action,entity_id,user,meta\n");
+        for (Map<String, Object> item : items) {
+            sb.append(csvField(item.get("timestamp"))).append(',')
+              .append(csvField(item.get("action"))).append(',')
+              .append(csvField(item.get("entity_id"))).append(',')
+              .append(csvField(item.get("user"))).append(',')
+              .append(csvField(item.get("meta")))
+              .append('\n');
+        }
+        return sb.toString();
+    }
+
+    private String csvField(Object o) {
+        String v = Val.str(o);
+        if (v.contains(",") || v.contains("\"") || v.contains("\n")) {
+            v = "\"" + v.replace("\"", "\"\"") + "\"";
+        }
+        return v;
     }
 }

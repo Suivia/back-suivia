@@ -13,6 +13,7 @@ import com.suivia.lambda.shared.Ws;
 
 import java.time.Instant;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 
 /** POST /invoices/{id}/purchase-order — manual PO association (RF07). */
@@ -28,13 +29,6 @@ public class LinkPoHandler implements RequestHandler<APIGatewayProxyRequestEvent
         Map<String, Object> body = Json.readMap(event.getBody());
         String user = Api.user(event);
 
-        String poId = body.containsKey("purchase_order_id")
-                ? Val.str(body.get("purchase_order_id"))
-                : Val.str(body.get("po_id"));
-        if (poId.isEmpty()) {
-            return Api.err("purchase_order_id required");
-        }
-
         Map<String, Object> item = Dynamo.getItem(MATCH, "id", invId);
         if (item == null) {
             return Api.err("Invoice not found", 404);
@@ -42,6 +36,34 @@ public class LinkPoHandler implements RequestHandler<APIGatewayProxyRequestEvent
 
         Map<String, Object> before = new HashMap<>(item);
         Map<String, Object> updates = new HashMap<>();
+
+        // RF07 — split linking: { links: [{ purchase_order_id, amount }, ...] }
+        Object linksObj = body.get("links");
+        if (linksObj instanceof List<?> linksList && !linksList.isEmpty()) {
+            String poId = Val.str(((Map<?, ?>) linksList.get(0)).get("purchase_order_id"));
+            updates.put("purchase_order_id", poId);
+            updates.put("linked_pos", Json.write(linksList));
+            updates.put("po_linked_by", user);
+            updates.put("po_linked_at", Instant.now().toString());
+            Dynamo.update(MATCH, "id", invId, updates);
+
+            Map<String, Object> after = new HashMap<>(before);
+            after.putAll(updates);
+            Map<String, Object> meta = new HashMap<>();
+            meta.put("ip", Api.sourceIp(event));
+            Audit.write(AUDIT, invId, "MANUAL_PO_SPLIT_LINK", user, before, after, meta);
+
+            Ws.broadcast("INVOICE_UPDATED", Map.of("match_id", invId, "purchase_order_id", poId));
+            return Api.ok(Map.of("id", invId, "purchase_order_id", poId, "links", linksList));
+        }
+
+        String poId = body.containsKey("purchase_order_id")
+                ? Val.str(body.get("purchase_order_id"))
+                : Val.str(body.get("po_id"));
+        if (poId.isEmpty()) {
+            return Api.err("purchase_order_id required");
+        }
+
         updates.put("purchase_order_id", poId);
         updates.put("linked_po", Json.write(body));
         updates.put("po_linked_by", user);

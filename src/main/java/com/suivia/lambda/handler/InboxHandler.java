@@ -6,7 +6,10 @@ import com.amazonaws.services.lambda.runtime.events.APIGatewayProxyRequestEvent;
 import com.amazonaws.services.lambda.runtime.events.APIGatewayProxyResponseEvent;
 import com.suivia.lambda.shared.Api;
 import com.suivia.lambda.shared.Dynamo;
+import com.suivia.lambda.shared.Erp;
+import com.suivia.lambda.shared.Val;
 
+import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 
@@ -21,6 +24,9 @@ public class InboxHandler implements RequestHandler<APIGatewayProxyRequestEvent,
         String path = event.getPath() == null ? "" : event.getPath();
         Map<String, String> params = event.getPathParameters();
         String id = params == null ? null : params.get("id");
+        if (path.endsWith("/po-suggestions")) {
+            return getPoSuggestions(id == null ? "" : id);
+        }
         if (path.contains("{id}") || (id != null && !id.isEmpty())) {
             return getInvoice(id == null ? "" : id);
         }
@@ -46,6 +52,26 @@ public class InboxHandler implements RequestHandler<APIGatewayProxyRequestEvent,
         }
         attachStaging(item);
         return Api.ok(item);
+    }
+
+    /** RF07 — top open POs for this invoice's CNPJ, ranked by proximity to the invoice total. */
+    private APIGatewayProxyResponseEvent getPoSuggestions(String invoiceId) {
+        Map<String, Object> match = Dynamo.getItem(MATCH, "id", invoiceId);
+        if (match == null) {
+            return Api.err("Invoice not found", 404);
+        }
+        Map<String, Object> staging = Dynamo.getItem(STAGING, "id", Val.str(match.get("staging_id")));
+        if (staging == null) {
+            return Api.ok(List.of());
+        }
+        String cnpj = Val.str(staging.get("supplier_cnpj"));
+        double nfTotal = Val.dbl(staging.get("total_amount"));
+        List<Map<String, Object>> candidates = Erp.listPurchaseOrders(cnpj, "");
+        List<Map<String, Object>> ranked = candidates.stream()
+                .sorted(Comparator.comparingDouble(c -> Math.abs(Val.dbl(c.get("total_amount")) - nfTotal)))
+                .limit(7)
+                .toList();
+        return Api.ok(ranked);
     }
 
     private void attachStaging(Map<String, Object> item) {

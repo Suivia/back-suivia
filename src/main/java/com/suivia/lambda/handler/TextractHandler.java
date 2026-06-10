@@ -76,6 +76,8 @@ public class TextractHandler implements RequestHandler<Map<String, Object>, Void
         String supplierCnpj = extractCnpj(orEmpty(summary.get("VENDOR_VAT_NUMBER"), summary.get("VENDOR_NAME")));
         double totalAmount = safeFloat(orEmpty(summary.get("AMOUNT_DUE"), summary.get("TOTAL")));
 
+        String invoiceKey = summary.getOrDefault("INVOICE_RECEIPT_ID", "");
+
         Map<String, Object> updates = new HashMap<>();
         updates.put("supplier_cnpj", supplierCnpj);
         updates.put("supplier_name", summary.getOrDefault("VENDOR_NAME", ""));
@@ -85,10 +87,19 @@ public class TextractHandler implements RequestHandler<Map<String, Object>, Void
         updates.put("bounding_boxes", Json.write(boxes));
         updates.put("status", "extracted");
         updates.put("processed_at", Instant.now().toString());
+
+        // RN08 — sem chave de NF-e (44 dígitos): trata como NFSe/nota manual,
+        // exigindo revisão humana obrigatória (cap de score em MatchEngineHandler).
+        boolean hasNfeKey = invoiceKey != null && invoiceKey.length() == 44;
+        if (!hasNfeKey) {
+            updates.put("doc_type", "nfse");
+            updates.put("requires_manual_validation", true);
+        } else {
+            updates.put("invoice_key", invoiceKey);
+        }
         Dynamo.update(STAGING, "id", stagingId, updates);
 
-        String invoiceKey = summary.getOrDefault("INVOICE_RECEIPT_ID", "");
-        if (invoiceKey != null && invoiceKey.length() == 44) {
+        if (hasNfeKey) {
             String payload = Json.write(Map.of("staging_id", stagingId, "invoice_key", invoiceKey));
             Aws.LAMBDA.invoke(b -> b.functionName(SEFAZ_FN)
                     .invocationType(InvocationType.EVENT)
