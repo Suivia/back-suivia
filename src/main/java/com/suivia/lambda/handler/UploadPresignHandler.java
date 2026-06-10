@@ -32,12 +32,10 @@ public class UploadPresignHandler implements RequestHandler<APIGatewayProxyReque
                 : "bin";
         String uid = UUID.randomUUID().toString();
         String s3Key = source + "/" + tenant + "/" + uid + "." + ext;
-        String contentType = ext.equals("xml") ? "application/xml" : "application/octet-stream";
 
         PutObjectRequest por = PutObjectRequest.builder()
                 .bucket(resolveBucket())
                 .key(s3Key)
-                .contentType(contentType)
                 .build();
         PutObjectPresignRequest presignReq = PutObjectPresignRequest.builder()
                 .signatureDuration(Duration.ofSeconds(300))

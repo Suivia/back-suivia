@@ -38,8 +38,17 @@ public class TextractHandler implements RequestHandler<Map<String, Object>, Void
         String bucket = Val.str(event.get("bucket"));
         String key = Val.str(event.get("key"));
 
-        AnalyzeExpenseResponse resp = Aws.TEXTRACT.analyzeExpense(b -> b.document(
-                d -> d.s3Object(s -> s.bucket(bucket).name(key))));
+        AnalyzeExpenseResponse resp;
+        try {
+            resp = Aws.TEXTRACT.analyzeExpense(b -> b.document(
+                    d -> d.s3Object(s -> s.bucket(bucket).name(key))));
+        } catch (Exception e) {
+            Dynamo.update(STAGING, "id", stagingId, Map.of(
+                    "status", "error",
+                    "error_message", Val.str(e.getMessage(), e.getClass().getSimpleName()),
+                    "processed_at", Instant.now().toString()));
+            return null;
+        }
 
         Map<String, String> summary = new LinkedHashMap<>();
         Map<String, Object> boxes = new LinkedHashMap<>();
